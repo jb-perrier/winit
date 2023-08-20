@@ -3,7 +3,7 @@
 mod runner;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     ffi::c_void,
     marker::PhantomData,
@@ -25,7 +25,7 @@ use windows_sys::Win32::{
     Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
-        ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL, RDW_INTERNALPAINT, SC_SCREENSAVE,
+        ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL, RDW_INTERNALPAINT, SC_SCREENSAVE, PAINTSTRUCT, BeginPaint, CreateSolidBrush, FillRect, DeleteObject, EndPaint, InvalidateRect,
     },
     System::{
         Ole::RevokeDragDrop,
@@ -68,8 +68,8 @@ use windows_sys::Win32::{
             WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
             WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED,
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP,
-            WS_VISIBLE,
-        },
+            WS_VISIBLE, HTBORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLOSE, HTERROR, HTHELP, HTHSCROLL, HTLEFT, HTMENU, HTMAXBUTTON, HTMINBUTTON, HTNOWHERE, HTREDUCE, HTRIGHT, HTSIZE, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, HTVSCROLL, HTZOOM, WM_NCHITTEST, IsZoomed, SM_CXFRAME, SM_CYFRAME, SM_CXPADDEDBORDER, WM_ACTIVATE, WM_NCRBUTTONDOWN, GetWindowRect, SWP_FRAMECHANGED,
+        }, HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
     },
 };
 
@@ -96,7 +96,7 @@ use crate::{
         window_state::{CursorFlags, ImeState, WindowFlags, WindowState},
         wrap_device_id, Fullscreen, WindowId, DEVICE_ID,
     },
-    window::WindowId as RootWindowId,
+    window::{WindowId as RootWindowId, WindowArea},
 };
 use runner::{EventLoopRunner, EventLoopRunnerShared};
 
@@ -982,6 +982,16 @@ pub(super) unsafe extern "system" fn public_window_callback<T: 'static>(
             let initdata = &mut *(initdata as *mut InitData<'_, T>);
 
             initdata.on_create();
+
+            let mut rect = std::mem::zeroed();
+            GetWindowRect(window, &mut rect);
+
+            SetWindowPos( window, 0,
+            rect.left, rect.top,
+            rect.right - rect.left, rect.bottom - rect.top,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
+      );
+
             return DefWindowProcW(window, msg, wparam, lparam);
         }
         (0, _) => return DefWindowProcW(window, msg, wparam, lparam),
@@ -1058,93 +1068,122 @@ unsafe fn public_window_callback_inner<T: 'static>(
     // the git blame and history would be preserved.
     let callback = || match msg {
         WM_NCCALCSIZE => {
-            let window_flags = userdata.window_state_lock().window_flags;
-            if wparam == 0 || window_flags.contains(WindowFlags::MARKER_DECORATIONS) {
-                result = ProcResult::DefWindowProc(wparam);
-                return;
-            }
+            let state = userdata.window_state_lock();
+            let window_flags = state.window_flags;
 
             let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
 
-            if util::is_maximized(window) {
-                // Limit the window size when maximized to the current monitor.
-                // Otherwise it would include the non-existent decorations.
-                //
-                // Use `MonitorFromRect` instead of `MonitorFromWindow` to select
-                // the correct monitor here.
-                // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/2549
-                let monitor = MonitorFromRect(&params.rgrc[0], MONITOR_DEFAULTTONULL);
-                if let Ok(monitor_info) = monitor::get_monitor_info(monitor) {
-                    params.rgrc[0] = monitor_info.monitorInfo.rcWork;
+            if window_flags.contains(WindowFlags::CUSTOM_FRAME) {
+                if wparam == 0 {
+                    result = ProcResult::DefWindowProc(wparam)
+                } else {
+                    let dpi = GetDpiForWindow(window);
+                    let frame_x = GetSystemMetricsForDpi(SM_CXFRAME, dpi);
+                    let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
+                    // should be 0 here, but when i run the same program C sample program it should not be 0 ..
+                    let mut padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+
+                    padding = 0;
+                    params.rgrc[0].right -= frame_x + padding;
+                    params.rgrc[0].left += frame_x + padding;
+                    params.rgrc[0].bottom -= frame_y + padding;
+
+                    if IsZoomed(window) != 0 {
+                        params.rgrc[0].top += padding;
+                    }
+                    result = ProcResult::Value(0);
                 }
-            } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
-                // Extend the client area to cover the whole non-client area.
-                // https://docs.microsoft.com/en-us/windows/win32/winmsg/wm-nccalcsize#remarks
-                //
-                // HACK(msiglreith): To add the drop shadow we slightly tweak the non-client area.
-                // This leads to a small black 1px border on the top. Adding a margin manually
-                // on all 4 borders would result in the caption getting drawn by the DWM.
-                //
-                // Another option would be to allow the DWM to paint inside the client area.
-                // Unfortunately this results in janky resize behavior, where the compositor is
-                // ahead of the window surface. Currently, there seems no option to achieve this
-                // with the Windows API.
-                params.rgrc[0].top += 1;
-                params.rgrc[0].bottom += 1;
+            } else {
+                if wparam == 0 || window_flags.contains(WindowFlags::MARKER_DECORATIONS) {
+                    result = ProcResult::DefWindowProc(wparam);
+                    return;
+                }
+
+                if util::is_maximized(window) {
+                    // Limit the window size when maximized to the current monitor.
+                    // Otherwise it would include the non-existent decorations.
+                    //
+                    // Use `MonitorFromRect` instead of `MonitorFromWindow` to select
+                    // the correct monitor here.
+                    // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/2549
+                    let monitor = MonitorFromRect(&params.rgrc[0], MONITOR_DEFAULTTONULL);
+                    if let Ok(monitor_info) = monitor::get_monitor_info(monitor) {
+                        params.rgrc[0] = monitor_info.monitorInfo.rcWork;
+                    }
+                } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
+                    // Extend the client area to cover the whole non-client area.
+                    // https://docs.microsoft.com/en-us/windows/win32/winmsg/wm-nccalcsize#remarks
+                    //
+                    // HACK(msiglreith): To add the drop shadow we slightly tweak the non-client area.
+                    // This leads to a small black 1px border on the top. Adding a margin manually
+                    // on all 4 borders would result in the caption getting drawn by the DWM.
+                    //
+                    // Another option would be to allow the DWM to paint inside the client area.
+                    // Unfortunately this results in janky resize behavior, where the compositor is
+                    // ahead of the window surface. Currently, there seems no option to achieve this
+                    // with the Windows API.
+                    params.rgrc[0].top += 1;
+                    params.rgrc[0].bottom += 1;
+                }
+    
+                result = ProcResult::Value(0);
             }
-
-            result = ProcResult::Value(0);
         }
 
-        WM_ENTERSIZEMOVE => {
-            userdata
-                .window_state_lock()
-                .set_window_flags_in_place(|f| f.insert(WindowFlags::MARKER_IN_SIZE_MOVE));
-            result = ProcResult::Value(0);
-        }
+        // WM_ENTERSIZEMOVE => {
+        //     userdata
+        //         .window_state_lock()
+        //         .set_window_flags_in_place(|f| f.insert(WindowFlags::MARKER_IN_SIZE_MOVE));
+        //     result = ProcResult::Value(0);
+        // }
 
-        WM_EXITSIZEMOVE => {
-            let mut state = userdata.window_state_lock();
-            if state.dragging {
-                state.dragging = false;
-                PostMessageW(window, WM_LBUTTONUP, 0, lparam);
-            }
+        // WM_EXITSIZEMOVE => {
+        //     let mut state = userdata.window_state_lock();
+        //     if state.dragging {
+        //         state.dragging = false;
+        //         PostMessageW(window, WM_LBUTTONUP, 0, lparam);
+        //     }
 
-            state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
-            result = ProcResult::Value(0);
-        }
+        //     state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
+        //     result = ProcResult::Value(0);
+        // }
 
         WM_NCLBUTTONDOWN => {
-            if wparam == HTCAPTION as _ {
-                PostMessageW(window, WM_MOUSEMOVE, 0, lparam);
+            
+            if userdata.window_state_lock().window_flags.contains(WindowFlags::CUSTOM_FRAME) && ((wparam == HTMAXBUTTON as _) || (wparam == HTMINBUTTON as _) || (wparam == HTCLOSE as _)) {
+                result = ProcResult::Value(0);
+            } else {
+                if wparam == HTCAPTION as _ {
+                    PostMessageW(window, WM_MOUSEMOVE, 0, lparam);
+                }
+                result = ProcResult::DefWindowProc(wparam);
             }
-            result = ProcResult::DefWindowProc(wparam);
         }
 
-        WM_CLOSE => {
-            use crate::event::WindowEvent::CloseRequested;
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: CloseRequested,
-            });
-            result = ProcResult::Value(0);
-        }
+        // WM_CLOSE => {
+        //     use crate::event::WindowEvent::CloseRequested;
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: CloseRequested,
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
 
-        WM_DESTROY => {
-            use crate::event::WindowEvent::Destroyed;
-            RevokeDragDrop(window);
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: Destroyed,
-            });
-            result = ProcResult::Value(0);
-        }
+        // WM_DESTROY => {
+        //     use crate::event::WindowEvent::Destroyed;
+        //     RevokeDragDrop(window);
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: Destroyed,
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
 
-        WM_NCDESTROY => {
-            super::set_window_long(window, GWL_USERDATA, 0);
-            userdata.userdata_removed.set(true);
-            result = ProcResult::Value(0);
-        }
+        // WM_NCDESTROY => {
+        //     super::set_window_long(window, GWL_USERDATA, 0);
+        //     userdata.userdata_removed.set(true);
+        //     result = ProcResult::Value(0);
+        // }
 
         WM_PAINT => {
             if userdata.event_loop_runner.should_buffer() {
@@ -1154,1078 +1193,1114 @@ unsafe fn public_window_callback_inner<T: 'static>(
             } else {
                 userdata.send_event(Event::RedrawRequested(RootWindowId(WindowId(window))));
             }
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        WM_WINDOWPOSCHANGING => {
-            let mut window_state = userdata.window_state_lock();
-            if let Some(ref mut fullscreen) = window_state.fullscreen {
-                let window_pos = &mut *(lparam as *mut WINDOWPOS);
-                let new_rect = RECT {
-                    left: window_pos.x,
-                    top: window_pos.y,
-                    right: window_pos.x + window_pos.cx,
-                    bottom: window_pos.y + window_pos.cy,
-                };
-
-                const NOMOVE_OR_NOSIZE: u32 = SWP_NOMOVE | SWP_NOSIZE;
-
-                let new_rect = if window_pos.flags & NOMOVE_OR_NOSIZE != 0 {
-                    let cur_rect = util::WindowArea::Outer.get_rect(window)
-                        .expect("Unexpected GetWindowRect failure; please report this error to https://github.com/rust-windowing/winit");
-
-                    match window_pos.flags & NOMOVE_OR_NOSIZE {
-                        NOMOVE_OR_NOSIZE => None,
-
-                        SWP_NOMOVE => Some(RECT {
-                            left: cur_rect.left,
-                            top: cur_rect.top,
-                            right: cur_rect.left + window_pos.cx,
-                            bottom: cur_rect.top + window_pos.cy,
-                        }),
-
-                        SWP_NOSIZE => Some(RECT {
-                            left: window_pos.x,
-                            top: window_pos.y,
-                            right: window_pos.x - cur_rect.left + cur_rect.right,
-                            bottom: window_pos.y - cur_rect.top + cur_rect.bottom,
-                        }),
-
-                        _ => unreachable!(),
-                    }
-                } else {
-                    Some(new_rect)
-                };
-
-                if let Some(new_rect) = new_rect {
-                    let new_monitor = MonitorFromRect(&new_rect, MONITOR_DEFAULTTONULL);
-                    match fullscreen {
-                        Fullscreen::Borderless(ref mut fullscreen_monitor) => {
-                            if new_monitor != 0
-                                && fullscreen_monitor
-                                    .as_ref()
-                                    .map(|monitor| new_monitor != monitor.hmonitor())
-                                    .unwrap_or(true)
-                            {
-                                if let Ok(new_monitor_info) = monitor::get_monitor_info(new_monitor)
-                                {
-                                    let new_monitor_rect = new_monitor_info.monitorInfo.rcMonitor;
-                                    window_pos.x = new_monitor_rect.left;
-                                    window_pos.y = new_monitor_rect.top;
-                                    window_pos.cx = new_monitor_rect.right - new_monitor_rect.left;
-                                    window_pos.cy = new_monitor_rect.bottom - new_monitor_rect.top;
-                                }
-                                *fullscreen_monitor = Some(MonitorHandle::new(new_monitor));
-                            }
-                        }
-                        Fullscreen::Exclusive(ref video_mode) => {
-                            let old_monitor = video_mode.monitor.hmonitor();
-                            if let Ok(old_monitor_info) = monitor::get_monitor_info(old_monitor) {
-                                let old_monitor_rect = old_monitor_info.monitorInfo.rcMonitor;
-                                window_pos.x = old_monitor_rect.left;
-                                window_pos.y = old_monitor_rect.top;
-                                window_pos.cx = old_monitor_rect.right - old_monitor_rect.left;
-                                window_pos.cy = old_monitor_rect.bottom - old_monitor_rect.top;
-                            }
-                        }
-                    }
-                }
-            }
-
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(window, &mut ps);
+            let brush = CreateSolidBrush(0x00202020);
+            FillRect(hdc, &ps.rcPaint, brush);
+            DeleteObject(brush);
+            EndPaint(window, &ps);
             result = ProcResult::Value(0);
+            // result = ProcResult::DefWindowProc(wparam);
         }
 
-        // WM_MOVE supplies client area positions, so we send Moved here instead.
-        WM_WINDOWPOSCHANGED => {
-            use crate::event::WindowEvent::Moved;
+        // WM_WINDOWPOSCHANGING => {
+        //     let mut window_state = userdata.window_state_lock();
+        //     if let Some(ref mut fullscreen) = window_state.fullscreen {
+        //         let window_pos = &mut *(lparam as *mut WINDOWPOS);
+        //         let new_rect = RECT {
+        //             left: window_pos.x,
+        //             top: window_pos.y,
+        //             right: window_pos.x + window_pos.cx,
+        //             bottom: window_pos.y + window_pos.cy,
+        //         };
 
-            let windowpos = lparam as *const WINDOWPOS;
-            if (*windowpos).flags & SWP_NOMOVE != SWP_NOMOVE {
-                let physical_position = PhysicalPosition::new((*windowpos).x, (*windowpos).y);
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: Moved(physical_position),
-                });
-            }
+        //         const NOMOVE_OR_NOSIZE: u32 = SWP_NOMOVE | SWP_NOSIZE;
 
-            // This is necessary for us to still get sent WM_SIZE.
-            result = ProcResult::DefWindowProc(wparam);
-        }
+        //         let new_rect = if window_pos.flags & NOMOVE_OR_NOSIZE != 0 {
+        //             let cur_rect = util::WindowArea::Outer.get_rect(window)
+        //                 .expect("Unexpected GetWindowRect failure; please report this error to https://github.com/rust-windowing/winit");
 
-        WM_SIZE => {
-            use crate::event::WindowEvent::Resized;
-            let w = super::loword(lparam as u32) as u32;
-            let h = super::hiword(lparam as u32) as u32;
+        //             match window_pos.flags & NOMOVE_OR_NOSIZE {
+        //                 NOMOVE_OR_NOSIZE => None,
 
-            let physical_size = PhysicalSize::new(w, h);
-            let event = Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: Resized(physical_size),
-            };
+        //                 SWP_NOMOVE => Some(RECT {
+        //                     left: cur_rect.left,
+        //                     top: cur_rect.top,
+        //                     right: cur_rect.left + window_pos.cx,
+        //                     bottom: cur_rect.top + window_pos.cy,
+        //                 }),
 
-            {
-                let mut w = userdata.window_state_lock();
-                // See WindowFlags::MARKER_RETAIN_STATE_ON_SIZE docs for info on why this `if` check exists.
-                if !w
-                    .window_flags()
-                    .contains(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE)
-                {
-                    let maximized = wparam == SIZE_MAXIMIZED as usize;
-                    w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
+        //                 SWP_NOSIZE => Some(RECT {
+        //                     left: window_pos.x,
+        //                     top: window_pos.y,
+        //                     right: window_pos.x - cur_rect.left + cur_rect.right,
+        //                     bottom: window_pos.y - cur_rect.top + cur_rect.bottom,
+        //                 }),
+
+        //                 _ => unreachable!(),
+        //             }
+        //         } else {
+        //             Some(new_rect)
+        //         };
+
+        //         if let Some(new_rect) = new_rect {
+        //             let new_monitor = MonitorFromRect(&new_rect, MONITOR_DEFAULTTONULL);
+        //             match fullscreen {
+        //                 Fullscreen::Borderless(ref mut fullscreen_monitor) => {
+        //                     if new_monitor != 0
+        //                         && fullscreen_monitor
+        //                             .as_ref()
+        //                             .map(|monitor| new_monitor != monitor.hmonitor())
+        //                             .unwrap_or(true)
+        //                     {
+        //                         if let Ok(new_monitor_info) = monitor::get_monitor_info(new_monitor)
+        //                         {
+        //                             let new_monitor_rect = new_monitor_info.monitorInfo.rcMonitor;
+        //                             window_pos.x = new_monitor_rect.left;
+        //                             window_pos.y = new_monitor_rect.top;
+        //                             window_pos.cx = new_monitor_rect.right - new_monitor_rect.left;
+        //                             window_pos.cy = new_monitor_rect.bottom - new_monitor_rect.top;
+        //                         }
+        //                         *fullscreen_monitor = Some(MonitorHandle::new(new_monitor));
+        //                     }
+        //                 }
+        //                 Fullscreen::Exclusive(ref video_mode) => {
+        //                     let old_monitor = video_mode.monitor.hmonitor();
+        //                     if let Ok(old_monitor_info) = monitor::get_monitor_info(old_monitor) {
+        //                         let old_monitor_rect = old_monitor_info.monitorInfo.rcMonitor;
+        //                         window_pos.x = old_monitor_rect.left;
+        //                         window_pos.y = old_monitor_rect.top;
+        //                         window_pos.cx = old_monitor_rect.right - old_monitor_rect.left;
+        //                         window_pos.cy = old_monitor_rect.bottom - old_monitor_rect.top;
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // // WM_MOVE supplies client area positions, so we send Moved here instead.
+        // WM_WINDOWPOSCHANGED => {
+        //     use crate::event::WindowEvent::Moved;
+
+        //     let windowpos = lparam as *const WINDOWPOS;
+        //     if (*windowpos).flags & SWP_NOMOVE != SWP_NOMOVE {
+        //         let physical_position = PhysicalPosition::new((*windowpos).x, (*windowpos).y);
+        //         userdata.send_event(Event::WindowEvent {
+        //             window_id: RootWindowId(WindowId(window)),
+        //             event: Moved(physical_position),
+        //         });
+        //     }
+
+        //     // This is necessary for us to still get sent WM_SIZE.
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // WM_SIZE => {
+        //     use crate::event::WindowEvent::Resized;
+        //     let w = super::loword(lparam as u32) as u32;
+        //     let h = super::hiword(lparam as u32) as u32;
+
+        //     let physical_size = PhysicalSize::new(w, h);
+        //     let event = Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: Resized(physical_size),
+        //     };
+
+        //     {
+        //         let mut w = userdata.window_state_lock();
+        //         // See WindowFlags::MARKER_RETAIN_STATE_ON_SIZE docs for info on why this `if` check exists.
+        //         if !w
+        //             .window_flags()
+        //             .contains(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE)
+        //         {
+        //             let maximized = wparam == SIZE_MAXIMIZED as usize;
+        //             w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
+        //         }
+        //     }
+        //     userdata.send_event(event);
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MENUCHAR => {
+        //     result = ProcResult::Value((MNC_CLOSE << 16) as isize);
+        // }
+
+        // WM_IME_STARTCOMPOSITION => {
+        //     let ime_allowed = userdata.window_state_lock().ime_allowed;
+        //     if ime_allowed {
+        //         userdata.window_state_lock().ime_state = ImeState::Enabled;
+
+        //         userdata.send_event(Event::WindowEvent {
+        //             window_id: RootWindowId(WindowId(window)),
+        //             event: WindowEvent::Ime(Ime::Enabled),
+        //         });
+        //     }
+
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // WM_IME_COMPOSITION => {
+        //     let ime_allowed_and_composing = {
+        //         let w = userdata.window_state_lock();
+        //         w.ime_allowed && w.ime_state != ImeState::Disabled
+        //     };
+        //     // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
+        //     // check whether composing.
+        //     if ime_allowed_and_composing {
+        //         let ime_context = ImeContext::current(window);
+
+        //         if lparam == 0 {
+        //             userdata.send_event(Event::WindowEvent {
+        //                 window_id: RootWindowId(WindowId(window)),
+        //                 event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        //             });
+        //         }
+
+        //         // Google Japanese Input and ATOK have both flags, so
+        //         // first, receive composing result if exist.
+        //         if (lparam as u32 & GCS_RESULTSTR) != 0 {
+        //             if let Some(text) = ime_context.get_composed_text() {
+        //                 userdata.window_state_lock().ime_state = ImeState::Enabled;
+
+        //                 userdata.send_event(Event::WindowEvent {
+        //                     window_id: RootWindowId(WindowId(window)),
+        //                     event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        //                 });
+        //                 userdata.send_event(Event::WindowEvent {
+        //                     window_id: RootWindowId(WindowId(window)),
+        //                     event: WindowEvent::Ime(Ime::Commit(text)),
+        //                 });
+        //             }
+        //         }
+
+        //         // Next, receive preedit range for next composing if exist.
+        //         if (lparam as u32 & GCS_COMPSTR) != 0 {
+        //             if let Some((text, first, last)) = ime_context.get_composing_text_and_cursor() {
+        //                 userdata.window_state_lock().ime_state = ImeState::Preedit;
+        //                 let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
+
+        //                 userdata.send_event(Event::WindowEvent {
+        //                     window_id: RootWindowId(WindowId(window)),
+        //                     event: WindowEvent::Ime(Ime::Preedit(text, cursor_range)),
+        //                 });
+        //             }
+        //         }
+        //     }
+
+        //     // Not calling DefWindowProc to hide composing text drawn by IME.
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_IME_ENDCOMPOSITION => {
+        //     let ime_allowed_or_composing = {
+        //         let w = userdata.window_state_lock();
+        //         w.ime_allowed || w.ime_state != ImeState::Disabled
+        //     };
+        //     if ime_allowed_or_composing {
+        //         if userdata.window_state_lock().ime_state == ImeState::Preedit {
+        //             // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
+        //             // trying receiving composing result and commit if exists.
+        //             let ime_context = ImeContext::current(window);
+        //             if let Some(text) = ime_context.get_composed_text() {
+        //                 userdata.send_event(Event::WindowEvent {
+        //                     window_id: RootWindowId(WindowId(window)),
+        //                     event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        //                 });
+        //                 userdata.send_event(Event::WindowEvent {
+        //                     window_id: RootWindowId(WindowId(window)),
+        //                     event: WindowEvent::Ime(Ime::Commit(text)),
+        //                 });
+        //             }
+        //         }
+
+        //         userdata.window_state_lock().ime_state = ImeState::Disabled;
+
+        //         userdata.send_event(Event::WindowEvent {
+        //             window_id: RootWindowId(WindowId(window)),
+        //             event: WindowEvent::Ime(Ime::Disabled),
+        //         });
+        //     }
+
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // WM_IME_SETCONTEXT => {
+        //     // Hide composing text drawn by IME.
+        //     let wparam = wparam & (!ISC_SHOWUICOMPOSITIONWINDOW as usize);
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // // this is necessary for us to maintain minimize/restore state
+        // WM_SYSCOMMAND => {
+        //     if wparam == SC_RESTORE as usize {
+        //         let mut w = userdata.window_state_lock();
+        //         w.set_window_flags_in_place(|f| f.set(WindowFlags::MINIMIZED, false));
+        //     }
+        //     if wparam == SC_MINIMIZE as usize {
+        //         let mut w = userdata.window_state_lock();
+        //         w.set_window_flags_in_place(|f| f.set(WindowFlags::MINIMIZED, true));
+        //     }
+        //     // Send `WindowEvent::Minimized` here if we decide to implement one
+
+        //     if wparam == SC_SCREENSAVE as usize {
+        //         let window_state = userdata.window_state_lock();
+        //         if window_state.fullscreen.is_some() {
+        //             result = ProcResult::Value(0);
+        //             return;
+        //         }
+        //     }
+
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // WM_MOUSEMOVE => {
+        //     use crate::event::WindowEvent::{CursorEntered, CursorMoved};
+        //     let mouse_was_outside_window = {
+        //         let mut w = userdata.window_state_lock();
+
+        //         let was_outside_window = !w.mouse.cursor_flags().contains(CursorFlags::IN_WINDOW);
+        //         w.mouse
+        //             .set_cursor_flags(window, |f| f.set(CursorFlags::IN_WINDOW, true))
+        //             .ok();
+        //         was_outside_window
+        //     };
+
+        //     if mouse_was_outside_window {
+        //         userdata.send_event(Event::WindowEvent {
+        //             window_id: RootWindowId(WindowId(window)),
+        //             event: CursorEntered {
+        //                 device_id: DEVICE_ID,
+        //             },
+        //         });
+
+        //         // Calling TrackMouseEvent in order to receive mouse leave events.
+        //         TrackMouseEvent(&mut TRACKMOUSEEVENT {
+        //             cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        //             dwFlags: TME_LEAVE,
+        //             hwndTrack: window,
+        //             dwHoverTime: HOVER_DEFAULT,
+        //         });
+        //     }
+
+        //     let x = super::get_x_lparam(lparam as u32) as f64;
+        //     let y = super::get_y_lparam(lparam as u32) as f64;
+        //     let position = PhysicalPosition::new(x, y);
+        //     let cursor_moved;
+        //     {
+        //         // handle spurious WM_MOUSEMOVE messages
+        //         // see https://devblogs.microsoft.com/oldnewthing/20031001-00/?p=42343
+        //         // and http://debugandconquer.blogspot.com/2015/08/the-cause-of-spurious-mouse-move.html
+        //         let mut w = userdata.window_state_lock();
+        //         cursor_moved = w.mouse.last_position != Some(position);
+        //         w.mouse.last_position = Some(position);
+        //     }
+        //     if cursor_moved {
+        //         update_modifiers(window, userdata);
+
+        //         userdata.send_event(Event::WindowEvent {
+        //             window_id: RootWindowId(WindowId(window)),
+        //             event: CursorMoved {
+        //                 device_id: DEVICE_ID,
+        //                 position,
+        //             },
+        //         });
+        //     }
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MOUSELEAVE => {
+        //     use crate::event::WindowEvent::CursorLeft;
+        //     {
+        //         let mut w = userdata.window_state_lock();
+        //         w.mouse
+        //             .set_cursor_flags(window, |f| f.set(CursorFlags::IN_WINDOW, false))
+        //             .ok();
+        //     }
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: CursorLeft {
+        //             device_id: DEVICE_ID,
+        //         },
+        //     });
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MOUSEWHEEL => {
+        //     use crate::event::MouseScrollDelta::LineDelta;
+
+        //     let value = (wparam >> 16) as i16;
+        //     let value = value as i32;
+        //     let value = value as f32 / WHEEL_DELTA as f32;
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: WindowEvent::MouseWheel {
+        //             device_id: DEVICE_ID,
+        //             delta: LineDelta(0.0, value),
+        //             phase: TouchPhase::Moved,
+        //         },
+        //     });
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MOUSEHWHEEL => {
+        //     use crate::event::MouseScrollDelta::LineDelta;
+
+        //     let value = (wparam >> 16) as i16;
+        //     let value = value as i32;
+        //     let value = -value as f32 / WHEEL_DELTA as f32; // NOTE: inverted! See https://github.com/rust-windowing/winit/pull/2105/
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: WindowEvent::MouseWheel {
+        //             device_id: DEVICE_ID,
+        //             delta: LineDelta(value, 0.0),
+        //             phase: TouchPhase::Moved,
+        //         },
+        //     });
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_KEYDOWN | WM_SYSKEYDOWN => {
+        //     if msg == WM_SYSKEYDOWN {
+        //         result = ProcResult::DefWindowProc(wparam);
+        //     }
+        // }
+
+        // WM_KEYUP | WM_SYSKEYUP => {
+        //     if msg == WM_SYSKEYUP && GetMenu(window) != 0 {
+        //         // let Windows handle event if the window has a native menu, a modal event loop
+        //         // is started here on Alt key up.
+        //         result = ProcResult::DefWindowProc(wparam);
+        //     }
+        // }
+
+        // WM_LBUTTONDOWN => {
+        //     use crate::event::{ElementState::Pressed, MouseButton::Left, WindowEvent::MouseInput};
+
+        //     capture_mouse(window, &mut userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Pressed,
+        //             button: Left,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_LBUTTONUP => {
+        //     use crate::event::{
+        //         ElementState::Released, MouseButton::Left, WindowEvent::MouseInput,
+        //     };
+
+        //     release_mouse(userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Released,
+        //             button: Left,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_RBUTTONDOWN => {
+        //     use crate::event::{
+        //         ElementState::Pressed, MouseButton::Right, WindowEvent::MouseInput,
+        //     };
+
+        //     capture_mouse(window, &mut userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Pressed,
+        //             button: Right,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_RBUTTONUP => {
+        //     use crate::event::{
+        //         ElementState::Released, MouseButton::Right, WindowEvent::MouseInput,
+        //     };
+
+        //     release_mouse(userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Released,
+        //             button: Right,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MBUTTONDOWN => {
+        //     use crate::event::{
+        //         ElementState::Pressed, MouseButton::Middle, WindowEvent::MouseInput,
+        //     };
+
+        //     capture_mouse(window, &mut userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Pressed,
+        //             button: Middle,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_MBUTTONUP => {
+        //     use crate::event::{
+        //         ElementState::Released, MouseButton::Middle, WindowEvent::MouseInput,
+        //     };
+
+        //     release_mouse(userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Released,
+        //             button: Middle,
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_XBUTTONDOWN => {
+        //     use crate::event::{
+        //         ElementState::Pressed, MouseButton::Back, MouseButton::Forward, MouseButton::Other,
+        //         WindowEvent::MouseInput,
+        //     };
+        //     let xbutton = super::get_xbutton_wparam(wparam as u32);
+
+        //     capture_mouse(window, &mut userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Pressed,
+        //             button: match xbutton {
+        //                 1 => Back,
+        //                 2 => Forward,
+        //                 _ => Other(xbutton),
+        //             },
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_XBUTTONUP => {
+        //     use crate::event::{
+        //         ElementState::Released, MouseButton::Back, MouseButton::Forward,
+        //         MouseButton::Other, WindowEvent::MouseInput,
+        //     };
+        //     let xbutton = super::get_xbutton_wparam(wparam as u32);
+
+        //     release_mouse(userdata.window_state_lock());
+
+        //     update_modifiers(window, userdata);
+
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: MouseInput {
+        //             device_id: DEVICE_ID,
+        //             state: Released,
+        //             button: match xbutton {
+        //                 1 => Back,
+        //                 2 => Forward,
+        //                 _ => Other(xbutton),
+        //             },
+        //         },
+        //     });
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_CAPTURECHANGED => {
+        //     // lparam here is a handle to the window which is gaining mouse capture.
+        //     // If it is the same as our window, then we're essentially retaining the capture. This
+        //     // can happen if `SetCapture` is called on our window when it already has the mouse
+        //     // capture.
+        //     if lparam != window {
+        //         userdata.window_state_lock().mouse.capture_count = 0;
+        //     }
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_TOUCH => {
+        //     let pcount = super::loword(wparam as u32) as usize;
+        //     let mut inputs = Vec::with_capacity(pcount);
+        //     let htouch = lparam;
+        //     if GetTouchInputInfo(
+        //         htouch,
+        //         pcount as u32,
+        //         inputs.as_mut_ptr(),
+        //         mem::size_of::<TOUCHINPUT>() as i32,
+        //     ) > 0
+        //     {
+        //         inputs.set_len(pcount);
+        //         for input in &inputs {
+        //             let mut location = POINT {
+        //                 x: input.x / 100,
+        //                 y: input.y / 100,
+        //             };
+
+        //             if ScreenToClient(window, &mut location) == false.into() {
+        //                 continue;
+        //             }
+
+        //             let x = location.x as f64 + (input.x % 100) as f64 / 100f64;
+        //             let y = location.y as f64 + (input.y % 100) as f64 / 100f64;
+        //             let location = PhysicalPosition::new(x, y);
+        //             userdata.send_event(Event::WindowEvent {
+        //                 window_id: RootWindowId(WindowId(window)),
+        //                 event: WindowEvent::Touch(Touch {
+        //                     phase: if util::has_flag(input.dwFlags, TOUCHEVENTF_DOWN) {
+        //                         TouchPhase::Started
+        //                     } else if util::has_flag(input.dwFlags, TOUCHEVENTF_UP) {
+        //                         TouchPhase::Ended
+        //                     } else if util::has_flag(input.dwFlags, TOUCHEVENTF_MOVE) {
+        //                         TouchPhase::Moved
+        //                     } else {
+        //                         continue;
+        //                     },
+        //                     location,
+        //                     force: None, // WM_TOUCH doesn't support pressure information
+        //                     id: input.dwID as u64,
+        //                     device_id: DEVICE_ID,
+        //                 }),
+        //             });
+        //         }
+        //     }
+        //     CloseTouchInputHandle(htouch);
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
+        //     if let (
+        //         Some(GetPointerFrameInfoHistory),
+        //         Some(SkipPointerFrameMessages),
+        //         Some(GetPointerDeviceRects),
+        //     ) = (
+        //         *GET_POINTER_FRAME_INFO_HISTORY,
+        //         *SKIP_POINTER_FRAME_MESSAGES,
+        //         *GET_POINTER_DEVICE_RECTS,
+        //     ) {
+        //         let pointer_id = super::loword(wparam as u32) as u32;
+        //         let mut entries_count = 0u32;
+        //         let mut pointers_count = 0u32;
+        //         if GetPointerFrameInfoHistory(
+        //             pointer_id,
+        //             &mut entries_count,
+        //             &mut pointers_count,
+        //             ptr::null_mut(),
+        //         ) == false.into()
+        //         {
+        //             result = ProcResult::Value(0);
+        //             return;
+        //         }
+
+        //         let pointer_info_count = (entries_count * pointers_count) as usize;
+        //         let mut pointer_infos = Vec::with_capacity(pointer_info_count);
+        //         if GetPointerFrameInfoHistory(
+        //             pointer_id,
+        //             &mut entries_count,
+        //             &mut pointers_count,
+        //             pointer_infos.as_mut_ptr(),
+        //         ) == false.into()
+        //         {
+        //             result = ProcResult::Value(0);
+        //             return;
+        //         }
+        //         pointer_infos.set_len(pointer_info_count);
+
+        //         // https://docs.microsoft.com/en-us/windows/desktop/api/winuser/nf-winuser-getpointerframeinfohistory
+        //         // The information retrieved appears in reverse chronological order, with the most recent entry in the first
+        //         // row of the returned array
+        //         for pointer_info in pointer_infos.iter().rev() {
+        //             let mut device_rect = mem::MaybeUninit::uninit();
+        //             let mut display_rect = mem::MaybeUninit::uninit();
+
+        //             if GetPointerDeviceRects(
+        //                 pointer_info.sourceDevice,
+        //                 device_rect.as_mut_ptr(),
+        //                 display_rect.as_mut_ptr(),
+        //             ) == false.into()
+        //             {
+        //                 continue;
+        //             }
+
+        //             let device_rect = device_rect.assume_init();
+        //             let display_rect = display_rect.assume_init();
+
+        //             // For the most precise himetric to pixel conversion we calculate the ratio between the resolution
+        //             // of the display device (pixel) and the touch device (himetric).
+        //             let himetric_to_pixel_ratio_x = (display_rect.right - display_rect.left) as f64
+        //                 / (device_rect.right - device_rect.left) as f64;
+        //             let himetric_to_pixel_ratio_y = (display_rect.bottom - display_rect.top) as f64
+        //                 / (device_rect.bottom - device_rect.top) as f64;
+
+        //             // ptHimetricLocation's origin is 0,0 even on multi-monitor setups.
+        //             // On multi-monitor setups we need to translate the himetric location to the rect of the
+        //             // display device it's attached to.
+        //             let x = display_rect.left as f64
+        //                 + pointer_info.ptHimetricLocation.x as f64 * himetric_to_pixel_ratio_x;
+        //             let y = display_rect.top as f64
+        //                 + pointer_info.ptHimetricLocation.y as f64 * himetric_to_pixel_ratio_y;
+
+        //             let mut location = POINT {
+        //                 x: x.floor() as i32,
+        //                 y: y.floor() as i32,
+        //             };
+
+        //             if ScreenToClient(window, &mut location) == false.into() {
+        //                 continue;
+        //             }
+
+        //             let force = match pointer_info.pointerType {
+        //                 PT_TOUCH => {
+        //                     let mut touch_info = mem::MaybeUninit::uninit();
+        //                     GET_POINTER_TOUCH_INFO.and_then(|GetPointerTouchInfo| {
+        //                         match GetPointerTouchInfo(
+        //                             pointer_info.pointerId,
+        //                             touch_info.as_mut_ptr(),
+        //                         ) {
+        //                             0 => None,
+        //                             _ => normalize_pointer_pressure(
+        //                                 touch_info.assume_init().pressure,
+        //                             ),
+        //                         }
+        //                     })
+        //                 }
+        //                 PT_PEN => {
+        //                     let mut pen_info = mem::MaybeUninit::uninit();
+        //                     GET_POINTER_PEN_INFO.and_then(|GetPointerPenInfo| {
+        //                         match GetPointerPenInfo(
+        //                             pointer_info.pointerId,
+        //                             pen_info.as_mut_ptr(),
+        //                         ) {
+        //                             0 => None,
+        //                             _ => {
+        //                                 normalize_pointer_pressure(pen_info.assume_init().pressure)
+        //                             }
+        //                         }
+        //                     })
+        //                 }
+        //                 _ => None,
+        //             };
+
+        //             let x = location.x as f64 + x.fract();
+        //             let y = location.y as f64 + y.fract();
+        //             let location = PhysicalPosition::new(x, y);
+        //             userdata.send_event(Event::WindowEvent {
+        //                 window_id: RootWindowId(WindowId(window)),
+        //                 event: WindowEvent::Touch(Touch {
+        //                     phase: if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_DOWN) {
+        //                         TouchPhase::Started
+        //                     } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UP) {
+        //                         TouchPhase::Ended
+        //                     } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UPDATE)
+        //                     {
+        //                         TouchPhase::Moved
+        //                     } else {
+        //                         continue;
+        //                     },
+        //                     location,
+        //                     force,
+        //                     id: pointer_info.pointerId as u64,
+        //                     device_id: DEVICE_ID,
+        //                 }),
+        //             });
+        //         }
+
+        //         SkipPointerFrameMessages(pointer_id);
+        //     }
+        //     result = ProcResult::Value(0);
+        // }
+// 
+        // WM_NCACTIVATE => {
+        //     let is_active = wparam != false.into();
+        //     let active_focus_changed = userdata.window_state_lock().set_active(is_active);
+        //     if active_focus_changed {
+        //         if is_active {
+        //             gain_active_focus(window, userdata);
+        //         } else {
+        //             lose_active_focus(window, userdata);
+        //         }
+        //     }
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        // WM_SETFOCUS => {
+        //     let active_focus_changed = userdata.window_state_lock().set_focused(true);
+        //     if active_focus_changed {
+        //         gain_active_focus(window, userdata);
+        //     }
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_KILLFOCUS => {
+        //     let active_focus_changed = userdata.window_state_lock().set_focused(false);
+        //     if active_focus_changed {
+        //         lose_active_focus(window, userdata);
+        //     }
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_SETCURSOR => {
+        //     let set_cursor_to = {
+        //         let window_state = userdata.window_state_lock();
+        //         // The return value for the preceding `WM_NCHITTEST` message is conveniently
+        //         // provided through the low-order word of lParam. We use that here since
+        //         // `WM_MOUSEMOVE` seems to come after `WM_SETCURSOR` for a given cursor movement.
+        //         let in_client_area = super::loword(lparam as u32) as u32 == HTCLIENT;
+        //         if in_client_area {
+        //             Some(window_state.mouse.cursor)
+        //         } else {
+        //             None
+        //         }
+        //     };
+
+        //     match set_cursor_to {
+        //         Some(cursor) => {
+        //             let cursor = LoadCursorW(0, util::to_windows_cursor(cursor));
+        //             SetCursor(cursor);
+        //             result = ProcResult::Value(0);
+        //         }
+        //         None => result = ProcResult::DefWindowProc(wparam),
+        //     }
+        // }
+
+        // WM_GETMINMAXINFO => {
+        //     let mmi = lparam as *mut MINMAXINFO;
+
+        //     let window_state = userdata.window_state_lock();
+        //     let window_flags = window_state.window_flags;
+
+        //     if window_state.min_size.is_some() || window_state.max_size.is_some() {
+        //         if let Some(min_size) = window_state.min_size {
+        //             let min_size = min_size.to_physical(window_state.scale_factor);
+        //             let (width, height): (u32, u32) =
+        //                 window_flags.adjust_size(window, min_size).into();
+        //             (*mmi).ptMinTrackSize = POINT {
+        //                 x: width as i32,
+        //                 y: height as i32,
+        //             };
+        //         }
+        //         if let Some(max_size) = window_state.max_size {
+        //             let max_size = max_size.to_physical(window_state.scale_factor);
+        //             let (width, height): (u32, u32) =
+        //                 window_flags.adjust_size(window, max_size).into();
+        //             (*mmi).ptMaxTrackSize = POINT {
+        //                 x: width as i32,
+        //                 y: height as i32,
+        //             };
+        //         }
+        //     }
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // // Only sent on Windows 8.1 or newer. On Windows 7 and older user has to log out to change
+        // // DPI, therefore all applications are closed while DPI is changing.
+        // WM_DPICHANGED => {
+        //     use crate::event::WindowEvent::ScaleFactorChanged;
+
+        //     // This message actually provides two DPI values - x and y. However MSDN says that
+        //     // "you only need to use either the X-axis or the Y-axis value when scaling your
+        //     // application since they are the same".
+        //     // https://msdn.microsoft.com/en-us/library/windows/desktop/dn312083(v=vs.85).aspx
+        //     let new_dpi_x = super::loword(wparam as u32) as u32;
+        //     let new_scale_factor = dpi_to_scale_factor(new_dpi_x);
+        //     let old_scale_factor: f64;
+
+        //     let (allow_resize, window_flags) = {
+        //         let mut window_state = userdata.window_state_lock();
+        //         old_scale_factor = window_state.scale_factor;
+        //         window_state.scale_factor = new_scale_factor;
+
+        //         if new_scale_factor == old_scale_factor {
+        //             result = ProcResult::Value(0);
+        //             return;
+        //         }
+
+        //         let allow_resize = window_state.fullscreen.is_none()
+        //             && !window_state.window_flags().contains(WindowFlags::MAXIMIZED);
+
+        //         (allow_resize, window_state.window_flags)
+        //     };
+
+        //     // New size as suggested by Windows.
+        //     let suggested_rect = *(lparam as *const RECT);
+
+        //     // The window rect provided is the window's outer size, not it's inner size. However,
+        //     // win32 doesn't provide an `UnadjustWindowRectEx` function to get the client rect from
+        //     // the outer rect, so we instead adjust the window rect to get the decoration margins
+        //     // and remove them from the outer size.
+        //     let margin_left: i32;
+        //     let margin_top: i32;
+        //     // let margin_right: i32;
+        //     // let margin_bottom: i32;
+        //     {
+        //         let adjusted_rect = window_flags
+        //             .adjust_rect(window, suggested_rect)
+        //             .unwrap_or(suggested_rect);
+        //         margin_left = suggested_rect.left - adjusted_rect.left;
+        //         margin_top = suggested_rect.top - adjusted_rect.top;
+        //         // margin_right = adjusted_rect.right - suggested_rect.right;
+        //         // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
+        //     }
+
+        //     let old_physical_inner_rect = util::WindowArea::Inner
+        //         .get_rect(window)
+        //         .expect("failed to query (old) inner window area");
+        //     let old_physical_inner_size = PhysicalSize::new(
+        //         (old_physical_inner_rect.right - old_physical_inner_rect.left) as u32,
+        //         (old_physical_inner_rect.bottom - old_physical_inner_rect.top) as u32,
+        //     );
+
+        //     // `allow_resize` prevents us from re-applying DPI adjustment to the restored size after
+        //     // exiting fullscreen (the restored size is already DPI adjusted).
+        //     let new_physical_inner_size = match allow_resize {
+        //         // We calculate our own size because the default suggested rect doesn't do a great job
+        //         // of preserving the window's logical size.
+        //         true => old_physical_inner_size
+        //             .to_logical::<f64>(old_scale_factor)
+        //             .to_physical::<u32>(new_scale_factor),
+        //         false => old_physical_inner_size,
+        //     };
+
+        //     let new_inner_size = Arc::new(Mutex::new(new_physical_inner_size));
+        //     userdata.send_event(Event::WindowEvent {
+        //         window_id: RootWindowId(WindowId(window)),
+        //         event: ScaleFactorChanged {
+        //             scale_factor: new_scale_factor,
+        //             inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
+        //         },
+        //     });
+
+        //     let new_physical_inner_size = *new_inner_size.lock().unwrap();
+        //     drop(new_inner_size);
+
+        //     let dragging_window: bool;
+
+        //     {
+        //         let window_state = userdata.window_state_lock();
+        //         dragging_window = window_state
+        //             .window_flags()
+        //             .contains(WindowFlags::MARKER_IN_SIZE_MOVE);
+        //         // Unset maximized if we're changing the window's size.
+        //         if new_physical_inner_size != old_physical_inner_size {
+        //             WindowState::set_window_flags(window_state, window, |f| {
+        //                 f.set(WindowFlags::MAXIMIZED, false)
+        //             });
+        //         }
+        //     }
+
+        //     let new_outer_rect: RECT;
+        //     {
+        //         let suggested_ul = (
+        //             suggested_rect.left + margin_left,
+        //             suggested_rect.top + margin_top,
+        //         );
+
+        //         let mut conservative_rect = RECT {
+        //             left: suggested_ul.0,
+        //             top: suggested_ul.1,
+        //             right: suggested_ul.0 + new_physical_inner_size.width as i32,
+        //             bottom: suggested_ul.1 + new_physical_inner_size.height as i32,
+        //         };
+
+        //         conservative_rect = window_flags
+        //             .adjust_rect(window, conservative_rect)
+        //             .unwrap_or(conservative_rect);
+
+        //         // If we're dragging the window, offset the window so that the cursor's
+        //         // relative horizontal position in the title bar is preserved.
+        //         if dragging_window {
+        //             let bias = {
+        //                 let cursor_pos = {
+        //                     let mut pos = mem::zeroed();
+        //                     GetCursorPos(&mut pos);
+        //                     pos
+        //                 };
+        //                 let suggested_cursor_horizontal_ratio = (cursor_pos.x - suggested_rect.left)
+        //                     as f64
+        //                     / (suggested_rect.right - suggested_rect.left) as f64;
+
+        //                 (cursor_pos.x
+        //                     - (suggested_cursor_horizontal_ratio
+        //                         * (conservative_rect.right - conservative_rect.left) as f64)
+        //                         as i32)
+        //                     - conservative_rect.left
+        //             };
+        //             conservative_rect.left += bias;
+        //             conservative_rect.right += bias;
+        //         }
+
+        //         // Check to see if the new window rect is on the monitor with the new DPI factor.
+        //         // If it isn't, offset the window so that it is.
+        //         let new_dpi_monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+        //         let conservative_rect_monitor =
+        //             MonitorFromRect(&conservative_rect, MONITOR_DEFAULTTONULL);
+        //         new_outer_rect = if conservative_rect_monitor == new_dpi_monitor {
+        //             conservative_rect
+        //         } else {
+        //             let get_monitor_rect = |monitor| {
+        //                 let mut monitor_info = MONITORINFO {
+        //                     cbSize: mem::size_of::<MONITORINFO>() as _,
+        //                     ..mem::zeroed()
+        //                 };
+        //                 GetMonitorInfoW(monitor, &mut monitor_info);
+        //                 monitor_info.rcMonitor
+        //             };
+        //             let wrong_monitor = conservative_rect_monitor;
+        //             let wrong_monitor_rect = get_monitor_rect(wrong_monitor);
+        //             let new_monitor_rect = get_monitor_rect(new_dpi_monitor);
+
+        //             // The direction to nudge the window in to get the window onto the monitor with
+        //             // the new DPI factor. We calculate this by seeing which monitor edges are
+        //             // shared and nudging away from the wrong monitor based on those.
+        //             #[allow(clippy::bool_to_int_with_if)]
+        //             let delta_nudge_to_dpi_monitor = (
+        //                 if wrong_monitor_rect.left == new_monitor_rect.right {
+        //                     -1
+        //                 } else if wrong_monitor_rect.right == new_monitor_rect.left {
+        //                     1
+        //                 } else {
+        //                     0
+        //                 },
+        //                 if wrong_monitor_rect.bottom == new_monitor_rect.top {
+        //                     1
+        //                 } else if wrong_monitor_rect.top == new_monitor_rect.bottom {
+        //                     -1
+        //                 } else {
+        //                     0
+        //                 },
+        //             );
+
+        //             let abort_after_iterations = new_monitor_rect.right - new_monitor_rect.left
+        //                 + new_monitor_rect.bottom
+        //                 - new_monitor_rect.top;
+        //             for _ in 0..abort_after_iterations {
+        //                 conservative_rect.left += delta_nudge_to_dpi_monitor.0;
+        //                 conservative_rect.right += delta_nudge_to_dpi_monitor.0;
+        //                 conservative_rect.top += delta_nudge_to_dpi_monitor.1;
+        //                 conservative_rect.bottom += delta_nudge_to_dpi_monitor.1;
+
+        //                 if MonitorFromRect(&conservative_rect, MONITOR_DEFAULTTONULL)
+        //                     == new_dpi_monitor
+        //                 {
+        //                     break;
+        //                 }
+        //             }
+
+        //             conservative_rect
+        //         };
+        //     }
+
+        //     SetWindowPos(
+        //         window,
+        //         0,
+        //         new_outer_rect.left,
+        //         new_outer_rect.top,
+        //         new_outer_rect.right - new_outer_rect.left,
+        //         new_outer_rect.bottom - new_outer_rect.top,
+        //         SWP_NOZORDER | SWP_NOACTIVATE,
+        //     );
+
+        //     result = ProcResult::Value(0);
+        // }
+
+        // WM_SETTINGCHANGE => {
+        //     use crate::event::WindowEvent::ThemeChanged;
+
+        //     let preferred_theme = userdata.window_state_lock().preferred_theme;
+
+        //     if preferred_theme.is_none() {
+        //         let new_theme = try_theme(window, preferred_theme);
+        //         let mut window_state = userdata.window_state_lock();
+
+        //         if window_state.current_theme != new_theme {
+        //             window_state.current_theme = new_theme;
+        //             drop(window_state);
+        //             userdata.send_event(Event::WindowEvent {
+        //                 window_id: RootWindowId(WindowId(window)),
+        //                 event: ThemeChanged(new_theme),
+        //             });
+        //         }
+        //     }
+        //     result = ProcResult::DefWindowProc(wparam);
+        // }
+
+        WM_NCHITTEST => {
+            let state = userdata.window_state_lock();
+            if state.window_flags().contains(WindowFlags::CUSTOM_FRAME) && state.hittest_fn.is_some() {
+                if let Some(func) = state.hittest_fn {
+                    let x = super::get_x_lparam(lparam as u32) as i32;
+                    let y = super::get_y_lparam(lparam as u32) as i32;
+
+                    let mut pt = POINT { x, y };
+                    ScreenToClient(window, &mut pt);
+
+                    let default = DefWindowProcW(window, msg, wparam, lparam);
+                    let value = WindowArea::from_wm_nchittesst(default);
+
+                    let ret = (func)(value, pt.x, pt.y);
+                    result = ProcResult::Value(ret.to_wm_nchittest());
                 }
-            }
-            userdata.send_event(event);
-            result = ProcResult::Value(0);
-        }
-
-        WM_MENUCHAR => {
-            result = ProcResult::Value((MNC_CLOSE << 16) as isize);
-        }
-
-        WM_IME_STARTCOMPOSITION => {
-            let ime_allowed = userdata.window_state_lock().ime_allowed;
-            if ime_allowed {
-                userdata.window_state_lock().ime_state = ImeState::Enabled;
-
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: WindowEvent::Ime(Ime::Enabled),
-                });
-            }
-
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        WM_IME_COMPOSITION => {
-            let ime_allowed_and_composing = {
-                let w = userdata.window_state_lock();
-                w.ime_allowed && w.ime_state != ImeState::Disabled
-            };
-            // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-            // check whether composing.
-            if ime_allowed_and_composing {
-                let ime_context = ImeContext::current(window);
-
-                if lparam == 0 {
-                    userdata.send_event(Event::WindowEvent {
-                        window_id: RootWindowId(WindowId(window)),
-                        event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                    });
-                }
-
-                // Google Japanese Input and ATOK have both flags, so
-                // first, receive composing result if exist.
-                if (lparam as u32 & GCS_RESULTSTR) != 0 {
-                    if let Some(text) = ime_context.get_composed_text() {
-                        userdata.window_state_lock().ime_state = ImeState::Enabled;
-
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                        });
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Commit(text)),
-                        });
-                    }
-                }
-
-                // Next, receive preedit range for next composing if exist.
-                if (lparam as u32 & GCS_COMPSTR) != 0 {
-                    if let Some((text, first, last)) = ime_context.get_composing_text_and_cursor() {
-                        userdata.window_state_lock().ime_state = ImeState::Preedit;
-                        let cursor_range = first.map(|f| (f, last.unwrap_or(f)));
-
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(text, cursor_range)),
-                        });
-                    }
-                }
-            }
-
-            // Not calling DefWindowProc to hide composing text drawn by IME.
-            result = ProcResult::Value(0);
-        }
-
-        WM_IME_ENDCOMPOSITION => {
-            let ime_allowed_or_composing = {
-                let w = userdata.window_state_lock();
-                w.ime_allowed || w.ime_state != ImeState::Disabled
-            };
-            if ime_allowed_or_composing {
-                if userdata.window_state_lock().ime_state == ImeState::Preedit {
-                    // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-                    // trying receiving composing result and commit if exists.
-                    let ime_context = ImeContext::current(window);
-                    if let Some(text) = ime_context.get_composed_text() {
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
-                        });
-                        userdata.send_event(Event::WindowEvent {
-                            window_id: RootWindowId(WindowId(window)),
-                            event: WindowEvent::Ime(Ime::Commit(text)),
-                        });
-                    }
-                }
-
-                userdata.window_state_lock().ime_state = ImeState::Disabled;
-
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: WindowEvent::Ime(Ime::Disabled),
-                });
-            }
-
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        WM_IME_SETCONTEXT => {
-            // Hide composing text drawn by IME.
-            let wparam = wparam & (!ISC_SHOWUICOMPOSITIONWINDOW as usize);
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        // this is necessary for us to maintain minimize/restore state
-        WM_SYSCOMMAND => {
-            if wparam == SC_RESTORE as usize {
-                let mut w = userdata.window_state_lock();
-                w.set_window_flags_in_place(|f| f.set(WindowFlags::MINIMIZED, false));
-            }
-            if wparam == SC_MINIMIZE as usize {
-                let mut w = userdata.window_state_lock();
-                w.set_window_flags_in_place(|f| f.set(WindowFlags::MINIMIZED, true));
-            }
-            // Send `WindowEvent::Minimized` here if we decide to implement one
-
-            if wparam == SC_SCREENSAVE as usize {
-                let window_state = userdata.window_state_lock();
-                if window_state.fullscreen.is_some() {
-                    result = ProcResult::Value(0);
-                    return;
-                }
-            }
-
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        WM_MOUSEMOVE => {
-            use crate::event::WindowEvent::{CursorEntered, CursorMoved};
-            let mouse_was_outside_window = {
-                let mut w = userdata.window_state_lock();
-
-                let was_outside_window = !w.mouse.cursor_flags().contains(CursorFlags::IN_WINDOW);
-                w.mouse
-                    .set_cursor_flags(window, |f| f.set(CursorFlags::IN_WINDOW, true))
-                    .ok();
-                was_outside_window
-            };
-
-            if mouse_was_outside_window {
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: CursorEntered {
-                        device_id: DEVICE_ID,
-                    },
-                });
-
-                // Calling TrackMouseEvent in order to receive mouse leave events.
-                TrackMouseEvent(&mut TRACKMOUSEEVENT {
-                    cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: window,
-                    dwHoverTime: HOVER_DEFAULT,
-                });
-            }
-
-            let x = super::get_x_lparam(lparam as u32) as f64;
-            let y = super::get_y_lparam(lparam as u32) as f64;
-            let position = PhysicalPosition::new(x, y);
-            let cursor_moved;
-            {
-                // handle spurious WM_MOUSEMOVE messages
-                // see https://devblogs.microsoft.com/oldnewthing/20031001-00/?p=42343
-                // and http://debugandconquer.blogspot.com/2015/08/the-cause-of-spurious-mouse-move.html
-                let mut w = userdata.window_state_lock();
-                cursor_moved = w.mouse.last_position != Some(position);
-                w.mouse.last_position = Some(position);
-            }
-            if cursor_moved {
-                update_modifiers(window, userdata);
-
-                userdata.send_event(Event::WindowEvent {
-                    window_id: RootWindowId(WindowId(window)),
-                    event: CursorMoved {
-                        device_id: DEVICE_ID,
-                        position,
-                    },
-                });
-            }
-
-            result = ProcResult::Value(0);
-        }
-
-        WM_MOUSELEAVE => {
-            use crate::event::WindowEvent::CursorLeft;
-            {
-                let mut w = userdata.window_state_lock();
-                w.mouse
-                    .set_cursor_flags(window, |f| f.set(CursorFlags::IN_WINDOW, false))
-                    .ok();
-            }
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: CursorLeft {
-                    device_id: DEVICE_ID,
-                },
-            });
-
-            result = ProcResult::Value(0);
-        }
-
-        WM_MOUSEWHEEL => {
-            use crate::event::MouseScrollDelta::LineDelta;
-
-            let value = (wparam >> 16) as i16;
-            let value = value as i32;
-            let value = value as f32 / WHEEL_DELTA as f32;
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::MouseWheel {
-                    device_id: DEVICE_ID,
-                    delta: LineDelta(0.0, value),
-                    phase: TouchPhase::Moved,
-                },
-            });
-
-            result = ProcResult::Value(0);
-        }
-
-        WM_MOUSEHWHEEL => {
-            use crate::event::MouseScrollDelta::LineDelta;
-
-            let value = (wparam >> 16) as i16;
-            let value = value as i32;
-            let value = -value as f32 / WHEEL_DELTA as f32; // NOTE: inverted! See https://github.com/rust-windowing/winit/pull/2105/
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: WindowEvent::MouseWheel {
-                    device_id: DEVICE_ID,
-                    delta: LineDelta(value, 0.0),
-                    phase: TouchPhase::Moved,
-                },
-            });
-
-            result = ProcResult::Value(0);
-        }
-
-        WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if msg == WM_SYSKEYDOWN {
+            } else {
                 result = ProcResult::DefWindowProc(wparam);
             }
         }
 
-        WM_KEYUP | WM_SYSKEYUP => {
-            if msg == WM_SYSKEYUP && GetMenu(window) != 0 {
-                // let Windows handle event if the window has a native menu, a modal event loop
-                // is started here on Alt key up.
-                result = ProcResult::DefWindowProc(wparam);
+        WM_ACTIVATE => {
+            let state = userdata.window_state_lock();
+            let window_flags = state.window_flags;
+            if window_flags.contains(WindowFlags::CUSTOM_FRAME) {
+                InvalidateRect(window, std::ptr::null(), 1);
             }
-        }
-
-        WM_LBUTTONDOWN => {
-            use crate::event::{ElementState::Pressed, MouseButton::Left, WindowEvent::MouseInput};
-
-            capture_mouse(window, &mut userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Pressed,
-                    button: Left,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_LBUTTONUP => {
-            use crate::event::{
-                ElementState::Released, MouseButton::Left, WindowEvent::MouseInput,
-            };
-
-            release_mouse(userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Released,
-                    button: Left,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_RBUTTONDOWN => {
-            use crate::event::{
-                ElementState::Pressed, MouseButton::Right, WindowEvent::MouseInput,
-            };
-
-            capture_mouse(window, &mut userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Pressed,
-                    button: Right,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_RBUTTONUP => {
-            use crate::event::{
-                ElementState::Released, MouseButton::Right, WindowEvent::MouseInput,
-            };
-
-            release_mouse(userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Released,
-                    button: Right,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_MBUTTONDOWN => {
-            use crate::event::{
-                ElementState::Pressed, MouseButton::Middle, WindowEvent::MouseInput,
-            };
-
-            capture_mouse(window, &mut userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Pressed,
-                    button: Middle,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_MBUTTONUP => {
-            use crate::event::{
-                ElementState::Released, MouseButton::Middle, WindowEvent::MouseInput,
-            };
-
-            release_mouse(userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Released,
-                    button: Middle,
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_XBUTTONDOWN => {
-            use crate::event::{
-                ElementState::Pressed, MouseButton::Back, MouseButton::Forward, MouseButton::Other,
-                WindowEvent::MouseInput,
-            };
-            let xbutton = super::get_xbutton_wparam(wparam as u32);
-
-            capture_mouse(window, &mut userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Pressed,
-                    button: match xbutton {
-                        1 => Back,
-                        2 => Forward,
-                        _ => Other(xbutton),
-                    },
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_XBUTTONUP => {
-            use crate::event::{
-                ElementState::Released, MouseButton::Back, MouseButton::Forward,
-                MouseButton::Other, WindowEvent::MouseInput,
-            };
-            let xbutton = super::get_xbutton_wparam(wparam as u32);
-
-            release_mouse(userdata.window_state_lock());
-
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: MouseInput {
-                    device_id: DEVICE_ID,
-                    state: Released,
-                    button: match xbutton {
-                        1 => Back,
-                        2 => Forward,
-                        _ => Other(xbutton),
-                    },
-                },
-            });
-            result = ProcResult::Value(0);
-        }
-
-        WM_CAPTURECHANGED => {
-            // lparam here is a handle to the window which is gaining mouse capture.
-            // If it is the same as our window, then we're essentially retaining the capture. This
-            // can happen if `SetCapture` is called on our window when it already has the mouse
-            // capture.
-            if lparam != window {
-                userdata.window_state_lock().mouse.capture_count = 0;
-            }
-            result = ProcResult::Value(0);
-        }
-
-        WM_TOUCH => {
-            let pcount = super::loword(wparam as u32) as usize;
-            let mut inputs = Vec::with_capacity(pcount);
-            let htouch = lparam;
-            if GetTouchInputInfo(
-                htouch,
-                pcount as u32,
-                inputs.as_mut_ptr(),
-                mem::size_of::<TOUCHINPUT>() as i32,
-            ) > 0
-            {
-                inputs.set_len(pcount);
-                for input in &inputs {
-                    let mut location = POINT {
-                        x: input.x / 100,
-                        y: input.y / 100,
-                    };
-
-                    if ScreenToClient(window, &mut location) == false.into() {
-                        continue;
-                    }
-
-                    let x = location.x as f64 + (input.x % 100) as f64 / 100f64;
-                    let y = location.y as f64 + (input.y % 100) as f64 / 100f64;
-                    let location = PhysicalPosition::new(x, y);
-                    userdata.send_event(Event::WindowEvent {
-                        window_id: RootWindowId(WindowId(window)),
-                        event: WindowEvent::Touch(Touch {
-                            phase: if util::has_flag(input.dwFlags, TOUCHEVENTF_DOWN) {
-                                TouchPhase::Started
-                            } else if util::has_flag(input.dwFlags, TOUCHEVENTF_UP) {
-                                TouchPhase::Ended
-                            } else if util::has_flag(input.dwFlags, TOUCHEVENTF_MOVE) {
-                                TouchPhase::Moved
-                            } else {
-                                continue;
-                            },
-                            location,
-                            force: None, // WM_TOUCH doesn't support pressure information
-                            id: input.dwID as u64,
-                            device_id: DEVICE_ID,
-                        }),
-                    });
-                }
-            }
-            CloseTouchInputHandle(htouch);
-            result = ProcResult::Value(0);
-        }
-
-        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
-            if let (
-                Some(GetPointerFrameInfoHistory),
-                Some(SkipPointerFrameMessages),
-                Some(GetPointerDeviceRects),
-            ) = (
-                *GET_POINTER_FRAME_INFO_HISTORY,
-                *SKIP_POINTER_FRAME_MESSAGES,
-                *GET_POINTER_DEVICE_RECTS,
-            ) {
-                let pointer_id = super::loword(wparam as u32) as u32;
-                let mut entries_count = 0u32;
-                let mut pointers_count = 0u32;
-                if GetPointerFrameInfoHistory(
-                    pointer_id,
-                    &mut entries_count,
-                    &mut pointers_count,
-                    ptr::null_mut(),
-                ) == false.into()
-                {
-                    result = ProcResult::Value(0);
-                    return;
-                }
-
-                let pointer_info_count = (entries_count * pointers_count) as usize;
-                let mut pointer_infos = Vec::with_capacity(pointer_info_count);
-                if GetPointerFrameInfoHistory(
-                    pointer_id,
-                    &mut entries_count,
-                    &mut pointers_count,
-                    pointer_infos.as_mut_ptr(),
-                ) == false.into()
-                {
-                    result = ProcResult::Value(0);
-                    return;
-                }
-                pointer_infos.set_len(pointer_info_count);
-
-                // https://docs.microsoft.com/en-us/windows/desktop/api/winuser/nf-winuser-getpointerframeinfohistory
-                // The information retrieved appears in reverse chronological order, with the most recent entry in the first
-                // row of the returned array
-                for pointer_info in pointer_infos.iter().rev() {
-                    let mut device_rect = mem::MaybeUninit::uninit();
-                    let mut display_rect = mem::MaybeUninit::uninit();
-
-                    if GetPointerDeviceRects(
-                        pointer_info.sourceDevice,
-                        device_rect.as_mut_ptr(),
-                        display_rect.as_mut_ptr(),
-                    ) == false.into()
-                    {
-                        continue;
-                    }
-
-                    let device_rect = device_rect.assume_init();
-                    let display_rect = display_rect.assume_init();
-
-                    // For the most precise himetric to pixel conversion we calculate the ratio between the resolution
-                    // of the display device (pixel) and the touch device (himetric).
-                    let himetric_to_pixel_ratio_x = (display_rect.right - display_rect.left) as f64
-                        / (device_rect.right - device_rect.left) as f64;
-                    let himetric_to_pixel_ratio_y = (display_rect.bottom - display_rect.top) as f64
-                        / (device_rect.bottom - device_rect.top) as f64;
-
-                    // ptHimetricLocation's origin is 0,0 even on multi-monitor setups.
-                    // On multi-monitor setups we need to translate the himetric location to the rect of the
-                    // display device it's attached to.
-                    let x = display_rect.left as f64
-                        + pointer_info.ptHimetricLocation.x as f64 * himetric_to_pixel_ratio_x;
-                    let y = display_rect.top as f64
-                        + pointer_info.ptHimetricLocation.y as f64 * himetric_to_pixel_ratio_y;
-
-                    let mut location = POINT {
-                        x: x.floor() as i32,
-                        y: y.floor() as i32,
-                    };
-
-                    if ScreenToClient(window, &mut location) == false.into() {
-                        continue;
-                    }
-
-                    let force = match pointer_info.pointerType {
-                        PT_TOUCH => {
-                            let mut touch_info = mem::MaybeUninit::uninit();
-                            GET_POINTER_TOUCH_INFO.and_then(|GetPointerTouchInfo| {
-                                match GetPointerTouchInfo(
-                                    pointer_info.pointerId,
-                                    touch_info.as_mut_ptr(),
-                                ) {
-                                    0 => None,
-                                    _ => normalize_pointer_pressure(
-                                        touch_info.assume_init().pressure,
-                                    ),
-                                }
-                            })
-                        }
-                        PT_PEN => {
-                            let mut pen_info = mem::MaybeUninit::uninit();
-                            GET_POINTER_PEN_INFO.and_then(|GetPointerPenInfo| {
-                                match GetPointerPenInfo(
-                                    pointer_info.pointerId,
-                                    pen_info.as_mut_ptr(),
-                                ) {
-                                    0 => None,
-                                    _ => {
-                                        normalize_pointer_pressure(pen_info.assume_init().pressure)
-                                    }
-                                }
-                            })
-                        }
-                        _ => None,
-                    };
-
-                    let x = location.x as f64 + x.fract();
-                    let y = location.y as f64 + y.fract();
-                    let location = PhysicalPosition::new(x, y);
-                    userdata.send_event(Event::WindowEvent {
-                        window_id: RootWindowId(WindowId(window)),
-                        event: WindowEvent::Touch(Touch {
-                            phase: if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_DOWN) {
-                                TouchPhase::Started
-                            } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UP) {
-                                TouchPhase::Ended
-                            } else if util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UPDATE)
-                            {
-                                TouchPhase::Moved
-                            } else {
-                                continue;
-                            },
-                            location,
-                            force,
-                            id: pointer_info.pointerId as u64,
-                            device_id: DEVICE_ID,
-                        }),
-                    });
-                }
-
-                SkipPointerFrameMessages(pointer_id);
-            }
-            result = ProcResult::Value(0);
-        }
-
-        WM_NCACTIVATE => {
-            let is_active = wparam != false.into();
-            let active_focus_changed = userdata.window_state_lock().set_active(is_active);
-            if active_focus_changed {
-                if is_active {
-                    gain_active_focus(window, userdata);
-                } else {
-                    lose_active_focus(window, userdata);
-                }
-            }
-            result = ProcResult::DefWindowProc(wparam);
-        }
-
-        WM_SETFOCUS => {
-            let active_focus_changed = userdata.window_state_lock().set_focused(true);
-            if active_focus_changed {
-                gain_active_focus(window, userdata);
-            }
-            result = ProcResult::Value(0);
-        }
-
-        WM_KILLFOCUS => {
-            let active_focus_changed = userdata.window_state_lock().set_focused(false);
-            if active_focus_changed {
-                lose_active_focus(window, userdata);
-            }
-            result = ProcResult::Value(0);
-        }
-
-        WM_SETCURSOR => {
-            let set_cursor_to = {
-                let window_state = userdata.window_state_lock();
-                // The return value for the preceding `WM_NCHITTEST` message is conveniently
-                // provided through the low-order word of lParam. We use that here since
-                // `WM_MOUSEMOVE` seems to come after `WM_SETCURSOR` for a given cursor movement.
-                let in_client_area = super::loword(lparam as u32) as u32 == HTCLIENT;
-                if in_client_area {
-                    Some(window_state.mouse.cursor)
-                } else {
-                    None
-                }
-            };
-
-            match set_cursor_to {
-                Some(cursor) => {
-                    let cursor = LoadCursorW(0, util::to_windows_cursor(cursor));
-                    SetCursor(cursor);
-                    result = ProcResult::Value(0);
-                }
-                None => result = ProcResult::DefWindowProc(wparam),
-            }
-        }
-
-        WM_GETMINMAXINFO => {
-            let mmi = lparam as *mut MINMAXINFO;
-
-            let window_state = userdata.window_state_lock();
-            let window_flags = window_state.window_flags;
-
-            if window_state.min_size.is_some() || window_state.max_size.is_some() {
-                if let Some(min_size) = window_state.min_size {
-                    let min_size = min_size.to_physical(window_state.scale_factor);
-                    let (width, height): (u32, u32) =
-                        window_flags.adjust_size(window, min_size).into();
-                    (*mmi).ptMinTrackSize = POINT {
-                        x: width as i32,
-                        y: height as i32,
-                    };
-                }
-                if let Some(max_size) = window_state.max_size {
-                    let max_size = max_size.to_physical(window_state.scale_factor);
-                    let (width, height): (u32, u32) =
-                        window_flags.adjust_size(window, max_size).into();
-                    (*mmi).ptMaxTrackSize = POINT {
-                        x: width as i32,
-                        y: height as i32,
-                    };
-                }
-            }
-
-            result = ProcResult::Value(0);
-        }
-
-        // Only sent on Windows 8.1 or newer. On Windows 7 and older user has to log out to change
-        // DPI, therefore all applications are closed while DPI is changing.
-        WM_DPICHANGED => {
-            use crate::event::WindowEvent::ScaleFactorChanged;
-
-            // This message actually provides two DPI values - x and y. However MSDN says that
-            // "you only need to use either the X-axis or the Y-axis value when scaling your
-            // application since they are the same".
-            // https://msdn.microsoft.com/en-us/library/windows/desktop/dn312083(v=vs.85).aspx
-            let new_dpi_x = super::loword(wparam as u32) as u32;
-            let new_scale_factor = dpi_to_scale_factor(new_dpi_x);
-            let old_scale_factor: f64;
-
-            let (allow_resize, window_flags) = {
-                let mut window_state = userdata.window_state_lock();
-                old_scale_factor = window_state.scale_factor;
-                window_state.scale_factor = new_scale_factor;
-
-                if new_scale_factor == old_scale_factor {
-                    result = ProcResult::Value(0);
-                    return;
-                }
-
-                let allow_resize = window_state.fullscreen.is_none()
-                    && !window_state.window_flags().contains(WindowFlags::MAXIMIZED);
-
-                (allow_resize, window_state.window_flags)
-            };
-
-            // New size as suggested by Windows.
-            let suggested_rect = *(lparam as *const RECT);
-
-            // The window rect provided is the window's outer size, not it's inner size. However,
-            // win32 doesn't provide an `UnadjustWindowRectEx` function to get the client rect from
-            // the outer rect, so we instead adjust the window rect to get the decoration margins
-            // and remove them from the outer size.
-            let margin_left: i32;
-            let margin_top: i32;
-            // let margin_right: i32;
-            // let margin_bottom: i32;
-            {
-                let adjusted_rect = window_flags
-                    .adjust_rect(window, suggested_rect)
-                    .unwrap_or(suggested_rect);
-                margin_left = suggested_rect.left - adjusted_rect.left;
-                margin_top = suggested_rect.top - adjusted_rect.top;
-                // margin_right = adjusted_rect.right - suggested_rect.right;
-                // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
-            }
-
-            let old_physical_inner_rect = util::WindowArea::Inner
-                .get_rect(window)
-                .expect("failed to query (old) inner window area");
-            let old_physical_inner_size = PhysicalSize::new(
-                (old_physical_inner_rect.right - old_physical_inner_rect.left) as u32,
-                (old_physical_inner_rect.bottom - old_physical_inner_rect.top) as u32,
-            );
-
-            // `allow_resize` prevents us from re-applying DPI adjustment to the restored size after
-            // exiting fullscreen (the restored size is already DPI adjusted).
-            let new_physical_inner_size = match allow_resize {
-                // We calculate our own size because the default suggested rect doesn't do a great job
-                // of preserving the window's logical size.
-                true => old_physical_inner_size
-                    .to_logical::<f64>(old_scale_factor)
-                    .to_physical::<u32>(new_scale_factor),
-                false => old_physical_inner_size,
-            };
-
-            let new_inner_size = Arc::new(Mutex::new(new_physical_inner_size));
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: ScaleFactorChanged {
-                    scale_factor: new_scale_factor,
-                    inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
-                },
-            });
-
-            let new_physical_inner_size = *new_inner_size.lock().unwrap();
-            drop(new_inner_size);
-
-            let dragging_window: bool;
-
-            {
-                let window_state = userdata.window_state_lock();
-                dragging_window = window_state
-                    .window_flags()
-                    .contains(WindowFlags::MARKER_IN_SIZE_MOVE);
-                // Unset maximized if we're changing the window's size.
-                if new_physical_inner_size != old_physical_inner_size {
-                    WindowState::set_window_flags(window_state, window, |f| {
-                        f.set(WindowFlags::MAXIMIZED, false)
-                    });
-                }
-            }
-
-            let new_outer_rect: RECT;
-            {
-                let suggested_ul = (
-                    suggested_rect.left + margin_left,
-                    suggested_rect.top + margin_top,
-                );
-
-                let mut conservative_rect = RECT {
-                    left: suggested_ul.0,
-                    top: suggested_ul.1,
-                    right: suggested_ul.0 + new_physical_inner_size.width as i32,
-                    bottom: suggested_ul.1 + new_physical_inner_size.height as i32,
-                };
-
-                conservative_rect = window_flags
-                    .adjust_rect(window, conservative_rect)
-                    .unwrap_or(conservative_rect);
-
-                // If we're dragging the window, offset the window so that the cursor's
-                // relative horizontal position in the title bar is preserved.
-                if dragging_window {
-                    let bias = {
-                        let cursor_pos = {
-                            let mut pos = mem::zeroed();
-                            GetCursorPos(&mut pos);
-                            pos
-                        };
-                        let suggested_cursor_horizontal_ratio = (cursor_pos.x - suggested_rect.left)
-                            as f64
-                            / (suggested_rect.right - suggested_rect.left) as f64;
-
-                        (cursor_pos.x
-                            - (suggested_cursor_horizontal_ratio
-                                * (conservative_rect.right - conservative_rect.left) as f64)
-                                as i32)
-                            - conservative_rect.left
-                    };
-                    conservative_rect.left += bias;
-                    conservative_rect.right += bias;
-                }
-
-                // Check to see if the new window rect is on the monitor with the new DPI factor.
-                // If it isn't, offset the window so that it is.
-                let new_dpi_monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
-                let conservative_rect_monitor =
-                    MonitorFromRect(&conservative_rect, MONITOR_DEFAULTTONULL);
-                new_outer_rect = if conservative_rect_monitor == new_dpi_monitor {
-                    conservative_rect
-                } else {
-                    let get_monitor_rect = |monitor| {
-                        let mut monitor_info = MONITORINFO {
-                            cbSize: mem::size_of::<MONITORINFO>() as _,
-                            ..mem::zeroed()
-                        };
-                        GetMonitorInfoW(monitor, &mut monitor_info);
-                        monitor_info.rcMonitor
-                    };
-                    let wrong_monitor = conservative_rect_monitor;
-                    let wrong_monitor_rect = get_monitor_rect(wrong_monitor);
-                    let new_monitor_rect = get_monitor_rect(new_dpi_monitor);
-
-                    // The direction to nudge the window in to get the window onto the monitor with
-                    // the new DPI factor. We calculate this by seeing which monitor edges are
-                    // shared and nudging away from the wrong monitor based on those.
-                    #[allow(clippy::bool_to_int_with_if)]
-                    let delta_nudge_to_dpi_monitor = (
-                        if wrong_monitor_rect.left == new_monitor_rect.right {
-                            -1
-                        } else if wrong_monitor_rect.right == new_monitor_rect.left {
-                            1
-                        } else {
-                            0
-                        },
-                        if wrong_monitor_rect.bottom == new_monitor_rect.top {
-                            1
-                        } else if wrong_monitor_rect.top == new_monitor_rect.bottom {
-                            -1
-                        } else {
-                            0
-                        },
-                    );
-
-                    let abort_after_iterations = new_monitor_rect.right - new_monitor_rect.left
-                        + new_monitor_rect.bottom
-                        - new_monitor_rect.top;
-                    for _ in 0..abort_after_iterations {
-                        conservative_rect.left += delta_nudge_to_dpi_monitor.0;
-                        conservative_rect.right += delta_nudge_to_dpi_monitor.0;
-                        conservative_rect.top += delta_nudge_to_dpi_monitor.1;
-                        conservative_rect.bottom += delta_nudge_to_dpi_monitor.1;
-
-                        if MonitorFromRect(&conservative_rect, MONITOR_DEFAULTTONULL)
-                            == new_dpi_monitor
-                        {
-                            break;
-                        }
-                    }
-
-                    conservative_rect
-                };
-            }
-
-            SetWindowPos(
-                window,
-                0,
-                new_outer_rect.left,
-                new_outer_rect.top,
-                new_outer_rect.right - new_outer_rect.left,
-                new_outer_rect.bottom - new_outer_rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-
-            result = ProcResult::Value(0);
-        }
-
-        WM_SETTINGCHANGE => {
-            use crate::event::WindowEvent::ThemeChanged;
-
-            let preferred_theme = userdata.window_state_lock().preferred_theme;
-
-            if preferred_theme.is_none() {
-                let new_theme = try_theme(window, preferred_theme);
-                let mut window_state = userdata.window_state_lock();
-
-                if window_state.current_theme != new_theme {
-                    window_state.current_theme = new_theme;
-                    drop(window_state);
-                    userdata.send_event(Event::WindowEvent {
-                        window_id: RootWindowId(WindowId(window)),
-                        event: ThemeChanged(new_theme),
-                    });
-                }
-            }
-            result = ProcResult::DefWindowProc(wparam);
         }
 
         _ => {
@@ -2516,5 +2591,69 @@ unsafe fn handle_raw_input<T: 'static>(userdata: &ThreadMsgTargetData<T>, data: 
                 state,
             }),
         });
+    }
+}
+
+impl WindowArea {
+    fn from_wm_nchittesst(m: isize) -> Self {
+        match m {
+            m if m == HTCAPTION as isize => Self::CAPTION,
+            m if m == HTBORDER as isize => Self::BORDER,
+            m if m == HTBOTTOM as isize => Self::BOTTOM,
+            m if m == HTBOTTOMLEFT as isize => Self::BOTTOMLEFT,
+            m if m == HTBOTTOMRIGHT as isize => Self::BOTTOMRIGHT,
+            m if m == HTCAPTION as isize => Self::CAPTION,
+            m if m == HTCLIENT as isize => Self::CLIENT,
+            m if m == HTCLOSE as isize => Self::CLOSE,
+            m if m == HTERROR as isize => Self::ERROR,
+            m if m == HTHELP as isize => Self::HELP,
+            m if m == HTHSCROLL as isize => Self::HSCROLL,
+            m if m == HTLEFT as isize => Self::LEFT,
+            m if m == HTMENU as isize => Self::MENU,
+            m if m == HTMAXBUTTON as isize => Self::MAXBUTTON,
+            m if m == HTMINBUTTON as isize => Self::MINBUTTON,
+            m if m == HTNOWHERE as isize => Self::NOWHERE,
+            m if m == HTREDUCE as isize => Self::REDUCE,
+            m if m == HTRIGHT as isize => Self::RIGHT,
+            m if m == HTSIZE as isize => Self::SIZE,
+            m if m == HTSYSMENU as isize => Self::SYSMENU,
+            m if m == HTTOP as isize => Self::TOP,
+            m if m == HTTOPLEFT as isize => Self::TOPLEFT,
+            m if m == HTTOPRIGHT as isize => Self::TOPRIGHT,
+            m if m == HTTRANSPARENT as isize => Self::TRANSPARENT,
+            m if m == HTVSCROLL as isize => Self::VSCROLL,
+            m if m == HTZOOM as isize => Self::ZOOM,
+            _ => Self::CLIENT,
+        }
+    }
+
+    fn to_wm_nchittest(&self) -> isize {
+        match self {
+            Self::BORDER => HTBORDER as isize,
+            Self::BOTTOM => HTBOTTOM as isize,
+            Self::BOTTOMLEFT => HTBOTTOMLEFT as isize,
+            Self::BOTTOMRIGHT => HTBOTTOMRIGHT as isize,
+            Self::CAPTION => HTCAPTION as isize,
+            Self::CLIENT => HTCLIENT as isize,
+            Self::CLOSE => HTCLOSE as isize,
+            Self::ERROR => HTERROR as isize,
+            Self::HELP => HTHELP as isize,
+            Self::HSCROLL => HTHSCROLL as isize,
+            Self::LEFT => HTLEFT as isize,
+            Self::MENU => HTMENU as isize,
+            Self::MAXBUTTON => HTMAXBUTTON as isize,
+            Self::MINBUTTON => HTMINBUTTON as isize,
+            Self::NOWHERE => HTNOWHERE as isize,
+            Self::REDUCE => HTREDUCE as isize,
+            Self::RIGHT => HTRIGHT as isize,
+            Self::SIZE => HTSIZE as isize,
+            Self::SYSMENU => HTSYSMENU as isize,
+            Self::TOP => HTTOP as isize,
+            Self::TOPLEFT => HTTOPLEFT as isize,
+            Self::TOPRIGHT => HTTOPRIGHT as isize,
+            Self::TRANSPARENT => HTTRANSPARENT as isize,
+            Self::VSCROLL => HTVSCROLL as isize,
+            Self::ZOOM => HTZOOM as isize,
+        }
     }
 }

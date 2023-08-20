@@ -18,7 +18,7 @@ pub(crate) use self::{
 pub use self::icon::WinIcon as PlatformIcon;
 pub(self) use crate::platform_impl::Fullscreen;
 
-use crate::event::DeviceId as RootDeviceId;
+use crate::{event::DeviceId as RootDeviceId, window::HitTestFn};
 use crate::icon::Icon;
 use crate::keyboard::Key;
 
@@ -32,6 +32,7 @@ pub struct PlatformSpecificWindowBuilderAttributes {
     pub skip_taskbar: bool,
     pub class_name: String,
     pub decoration_shadow: bool,
+    pub hittest_fn: Option<HitTestFn>
 }
 
 impl Default for PlatformSpecificWindowBuilderAttributes {
@@ -45,6 +46,7 @@ impl Default for PlatformSpecificWindowBuilderAttributes {
             skip_taskbar: false,
             class_name: "Window Class".to_string(),
             decoration_shadow: false,
+            hittest_fn: None
         }
     }
 }

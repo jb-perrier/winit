@@ -3,7 +3,7 @@ use crate::{
     icon::Icon,
     keyboard::ModifiersState,
     platform_impl::platform::{event_loop, util, Fullscreen},
-    window::{CursorIcon, Theme, WindowAttributes},
+    window::{CursorIcon, Theme, WindowAttributes, HitTestFn},
 };
 use std::io;
 use std::sync::MutexGuard;
@@ -20,7 +20,7 @@ use windows_sys::Win32::{
         WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_ACCEPTFILES, WS_EX_APPWINDOW,
         WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         WS_EX_WINDOWEDGE, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZE, WS_MINIMIZEBOX,
-        WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX, WS_SYSMENU, WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SIZEBOX, WS_SYSMENU, WS_VISIBLE, WS_THICKFRAME,
     },
 };
 
@@ -55,6 +55,8 @@ pub(crate) struct WindowState {
     pub dragging: bool,
 
     pub skip_taskbar: bool,
+
+    pub hittest_fn: Option<HitTestFn>,
 }
 
 #[derive(Clone)]
@@ -121,6 +123,8 @@ bitflags! {
         const MARKER_ACTIVATE = 1 << 21;
 
         const EXCLUSIVE_FULLSCREEN_OR_MASK = WindowFlags::ALWAYS_ON_TOP.bits();
+
+        const CUSTOM_FRAME = 1 << 22;
     }
 }
 
@@ -170,6 +174,8 @@ impl WindowState {
             dragging: false,
 
             skip_taskbar: false,
+
+            hittest_fn: None,
         }
     }
 
@@ -247,23 +253,35 @@ impl WindowFlags {
     }
 
     pub fn to_window_styles(self) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
-        // Required styles to properly support common window functionality like aero snap.
-        let mut style = WS_CAPTION | WS_BORDER | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_SYSMENU;
-        let mut style_ex = WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES;
+        let mut style = {
+            if self.contains(WindowFlags::CUSTOM_FRAME) {
+                WS_THICKFRAME | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_VISIBLE
+            } else {
+                // Required styles to properly support common window functionality like aero snap.
+                WS_CAPTION | WS_BORDER | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_SYSMENU
+            }
+        };
+        let mut style_ex = {
+            if self.contains(WindowFlags::CUSTOM_FRAME) {
+                WS_EX_APPWINDOW | WS_EX_ACCEPTFILES
+            } else {
+                WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES
+            }
+        };
 
-        if self.contains(WindowFlags::RESIZABLE) {
+        if self.contains(WindowFlags::RESIZABLE) && !self.contains(WindowFlags::CUSTOM_FRAME) {
             style |= WS_SIZEBOX;
         }
-        if self.contains(WindowFlags::MAXIMIZABLE) {
+        if self.contains(WindowFlags::MAXIMIZABLE) && !self.contains(WindowFlags::CUSTOM_FRAME) {
             style |= WS_MAXIMIZEBOX;
         }
-        if self.contains(WindowFlags::MINIMIZABLE) {
+        if self.contains(WindowFlags::MINIMIZABLE) && !self.contains(WindowFlags::CUSTOM_FRAME) {
             style |= WS_MINIMIZEBOX;
         }
         if self.contains(WindowFlags::VISIBLE) {
             style |= WS_VISIBLE;
         }
-        if self.contains(WindowFlags::ON_TASKBAR) {
+        if self.contains(WindowFlags::ON_TASKBAR) && !self.contains(WindowFlags::CUSTOM_FRAME) {
             style_ex |= WS_EX_APPWINDOW;
         }
         if self.contains(WindowFlags::ALWAYS_ON_TOP) {
@@ -275,7 +293,7 @@ impl WindowFlags {
         if self.contains(WindowFlags::CHILD) {
             style |= WS_CHILD; // This is incompatible with WS_POPUP if that gets added eventually.
         }
-        if self.contains(WindowFlags::POPUP) {
+        if self.contains(WindowFlags::POPUP) && !self.contains(WindowFlags::CUSTOM_FRAME) {
             style |= WS_POPUP;
         }
         if self.contains(WindowFlags::MINIMIZED) {

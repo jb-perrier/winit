@@ -940,12 +940,13 @@ impl<'a, T: 'static> InitData<'a, T> {
         let current_theme = try_theme(window, self.attributes.preferred_theme);
 
         let window_state = {
-            let window_state = WindowState::new(
+            let mut window_state = WindowState::new(
                 &self.attributes,
                 scale_factor,
                 current_theme,
                 self.attributes.preferred_theme,
             );
+            window_state.hittest_fn = self.pl_attribs.hittest_fn;
             let window_state = Arc::new(Mutex::new(window_state));
             WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
                 *f = self.window_flags
@@ -1139,6 +1140,8 @@ where
     // Will be changed later using `window.set_enabled_buttons` but we need to set a default here
     // so the diffing later can work.
     window_flags.set(WindowFlags::CLOSABLE, true);
+
+    window_flags.set(WindowFlags::CUSTOM_FRAME, pl_attribs.hittest_fn.is_some());
 
     let parent = match attributes.parent_window {
         Some(RawWindowHandle::Win32(handle)) => {

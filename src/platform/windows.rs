@@ -8,7 +8,7 @@ use crate::{
     monitor::MonitorHandle,
     platform::modifier_supplement::KeyEventExtModifierSupplement,
     platform_impl::WinIcon,
-    window::{BadIcon, Icon, Window, WindowBuilder},
+    window::{BadIcon, Icon, Window, WindowBuilder, HitTestFn},
 };
 
 /// Window Handle type used by Win32 API
@@ -212,6 +212,9 @@ pub trait WindowBuilderExtWindows {
     /// The shadow is hidden by default.
     /// Enabling the shadow causes a thin 1px line to appear on the top of the window.
     fn with_undecorated_shadow(self, shadow: bool) -> WindowBuilder;
+
+    /// Provide a custom hit function, in order to handle ucstom frames.
+    fn with_hittest_fn(self, func: HitTestFn) -> WindowBuilder;
 }
 
 impl WindowBuilderExtWindows for WindowBuilder {
@@ -260,6 +263,12 @@ impl WindowBuilderExtWindows for WindowBuilder {
     #[inline]
     fn with_undecorated_shadow(mut self, shadow: bool) -> WindowBuilder {
         self.platform_specific.decoration_shadow = shadow;
+        self
+    }
+
+    #[inline]
+    fn with_hittest_fn(mut self, func: HitTestFn) -> WindowBuilder {
+        self.platform_specific.hittest_fn = Some(func);
         self
     }
 }
